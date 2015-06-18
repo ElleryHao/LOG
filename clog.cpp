@@ -2,7 +2,7 @@
 #include<string>
 #include <stdarg.h>
 #include<time.h>
-
+//author hzkai
 #define DateTimeFormat "%Y-%m-%d %H:%M:%S"
 
 
@@ -51,6 +51,6 @@ void Log::writeLog(LogLevel logLevel,const char* fmt,...)
 	va_end(ap);
 	time_t now = time(NULL);
 	char buf[STRING_LENGTH]={0};
-    strftime(buf, sizeof(buf), DateTimeFormat, gmtime(&now));
+  strftime(buf, sizeof(buf), DateTimeFormat, gmtime(&now));
 	fprintf(m_fileStream,"%s %s | %s\r\n",buf,LevelMsg[logLevel],temp);
 }
