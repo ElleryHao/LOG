@@ -15,9 +15,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <fstream>
-#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
