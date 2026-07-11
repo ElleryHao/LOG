@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -69,6 +70,17 @@ struct LogConfig
 	static std::string defaultLogPath();                   // platform introspection: exe basename + ".log" (H5)
 };
 
+// Reliable in-memory counters, independent of rotation/backup deletion — a validation harness
+// that reads these instead of rescanning log files on disk gets an accurate tally even when
+// rows have since been rotated away or a backup was pruned by count/age (see log.cpp).
+struct LogStats
+{
+	unsigned long long enqueuedOk;   // writeLog calls that were accepted and pushed onto the queue
+	unsigned long long written;      // lines actually fwrite()-succeeded to disk (business lines only)
+	unsigned long long dropped;      // writeLog calls dropped because the queue was at maxQueueSize
+	unsigned long long writeErrors;  // current consecutive short-write streak (see writeEntry)
+};
+
 class Log
 {
 public:
@@ -81,6 +93,7 @@ public:
 	void flush();
 	void shutdown();
 	void triggerMaintenance();
+	LogStats stats() const;               // snapshot of reliable in-memory counters (see LogStats)
 
 	int openFile(const char* fileName);   // legacy-signature compat shim; cannot rename a running sink (H3)
 
@@ -96,7 +109,7 @@ private:
 	void startWorker();
 	void stopWorkerLocked(bool terminal);
 	void workerLoop();
-	void writeEntry(const std::string& line);
+	void writeEntry(const std::string& line, bool countWritten = true);   // countWritten=false for internal notices
 	void rotateIfNeeded(std::size_t);
 	void doRotate();
 	void cleanupOldBackups();
@@ -127,7 +140,11 @@ private:
 	std::condition_variable  m_cvDrained;
 	std::queue<Entry>        m_queue;
 	bool                     m_draining;       // drain barrier (C1); read/written only under m_mutex
-	std::atomic<std::size_t> m_dropped;
+	std::atomic<std::size_t> m_dropped;        // periodically exchanged(0) by workerLoop to emit the
+	                                            // "dropped N" notice — NOT a running total, see m_droppedTotal
+	std::atomic<std::uint64_t> m_written;      // writeEntry successes (business lines only, stats())
+	std::atomic<std::uint64_t> m_enqueuedOk;   // writeLog pushes accepted onto m_queue (stats())
+	std::atomic<std::uint64_t> m_droppedTotal; // cumulative drop count for stats(); never reset
 
 	std::mutex               m_initMutex;      // serializes init/auto-start/stop transitions (H4)
 	std::thread              m_worker;

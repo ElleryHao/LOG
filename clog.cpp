@@ -169,7 +169,7 @@ Log::Log()
 	: m_enabled(true), m_level(INFO), m_flushLevel(ERROR), m_maxQueueSize(100000),
 	  m_stop(false), m_running(false), m_started(false), m_everStarted(false),
 	  m_initialized(false), m_maintenanceReq(false),
-	  m_draining(false), m_dropped(0),
+	  m_draining(false), m_dropped(0), m_written(0), m_enqueuedOk(0), m_droppedTotal(0),
 	  m_fileStream(nullptr), m_curSize(0), m_writeErrors(0),
 	  m_lastCleanup(std::chrono::steady_clock::now())
 {
@@ -307,13 +307,19 @@ void Log::writeLog(LogLevel level, const char* fmt, ...)
 	{
 		std::lock_guard<std::mutex> lk(m_mutex);
 		std::size_t cap = m_maxQueueSize.load(std::memory_order_relaxed);
-		if (cap && m_queue.size() >= cap) { m_dropped.fetch_add(1, std::memory_order_relaxed); return; }   // [B4]
+		if (cap && m_queue.size() >= cap)   // [B4]
+		{
+			m_dropped.fetch_add(1, std::memory_order_relaxed);        // periodic notice counter
+			m_droppedTotal.fetch_add(1, std::memory_order_relaxed);   // FIX: running total for stats()
+			return;
+		}
 		m_queue.push(Entry{ level, std::move(line) });
 	}
+	m_enqueuedOk.fetch_add(1, std::memory_order_relaxed);   // FIX: running total for stats()
 	m_cvWork.notify_one();   // notify after unlocking
 }
 
-void Log::writeEntry(const std::string& line)   // worker-only
+void Log::writeEntry(const std::string& line, bool countWritten)   // worker-only
 {
 	if (!m_fileStream) return;   // [B2]
 	std::size_t n = std::fwrite(line.data(), 1, line.size(), m_fileStream);
@@ -334,6 +340,10 @@ void Log::writeEntry(const std::string& line)   // worker-only
 	}
 	m_writeErrors = 0;
 	m_curSize += n;
+	// FIX: reliable in-memory counter for stats() — independent of rotation/backup deletion.
+	// countWritten=false for the internal "dropped N" notice line (see workerLoop) so it never
+	// inflates the business-message tally that produced == written + dropped depends on.
+	if (countWritten) m_written.fetch_add(1, std::memory_order_relaxed);
 	rotateIfNeeded(0);
 }
 
@@ -363,7 +373,10 @@ void Log::workerLoop()   // m_running already true (set by startWorker)
 			{
 				char ts[32];
 				formatLocalTime(ts, sizeof(ts));
-				writeEntry(std::string(ts) + " WARN | [logger] dropped " + std::to_string(d) + " messages\n");
+				// countWritten=false: this is an internal notice, not a business message counted
+				// by any caller's "produced" tally (see writeEntry).
+				writeEntry(std::string(ts) + " WARN | [logger] dropped " + std::to_string(d) + " messages\n",
+				           /*countWritten=*/false);
 			}
 			if (m_fileStream) std::fflush(m_fileStream);   // [R9-4] flush per batch, not per line
 
@@ -421,6 +434,19 @@ void Log::triggerMaintenance()
 {
 	m_maintenanceReq.store(true);
 	m_cvWork.notify_one();
+}
+
+// enqueuedOk/written/dropped are plain atomic loads, safe at any time. writeErrors mirrors the
+// worker-owned consecutive-short-write counter (§0.4 discipline) — call after flush()/shutdown()
+// so the drain barrier's happens-before covers this read too, same rule as other worker-owned state.
+LogStats Log::stats() const
+{
+	LogStats s;
+	s.enqueuedOk  = m_enqueuedOk.load(std::memory_order_relaxed);
+	s.written     = m_written.load(std::memory_order_relaxed);
+	s.dropped     = m_droppedTotal.load(std::memory_order_relaxed);
+	s.writeErrors = static_cast<unsigned long long>(m_writeErrors);
+	return s;
 }
 
 void Log::rotateIfNeeded(std::size_t)
